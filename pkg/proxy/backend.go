@@ -4,8 +4,10 @@
 package proxy
 
 import (
+	"bytes"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,13 +18,21 @@ import (
 	"github.com/CodisLabs/codis/pkg/utils/sync2/atomic2"
 )
 
+const (
+	stateConnected = 1
+	stateDataStale = 2
+)
+
 type BackendConn struct {
 	stop sync.Once
 	addr string
 
 	input chan *Request
-	delay time.Duration
-	ready atomic2.Bool
+	retry struct {
+		fails int
+		delay Delay
+	}
+	state atomic2.Int64
 
 	closed atomic2.Bool
 	config *Config
@@ -33,6 +43,10 @@ func NewBackendConn(addr string, config *Config) *BackendConn {
 		addr: addr, config: config,
 	}
 	bc.input = make(chan *Request, 1024)
+	bc.retry.delay = &DelayExp2{
+		Min: 50, Max: 5000,
+		Unit: time.Millisecond,
+	}
 
 	go bc.run()
 
@@ -51,7 +65,7 @@ func (bc *BackendConn) Close() {
 }
 
 func (bc *BackendConn) IsConnected() bool {
-	return bc.ready.Get()
+	return bc.state.Int64() == stateConnected
 }
 
 func (bc *BackendConn) PushBack(r *Request) {
@@ -65,24 +79,83 @@ func (bc *BackendConn) KeepAlive() bool {
 	if len(bc.input) != 0 {
 		return false
 	}
-	m := &Request{}
-	m.Multi = []*redis.Resp{
-		redis.NewBulkBytes([]byte("PING")),
+	switch bc.state.Int64() {
+	default:
+		m := &Request{}
+		m.Multi = []*redis.Resp{
+			redis.NewBulkBytes([]byte("PING")),
+		}
+		bc.PushBack(m)
+
+	case stateDataStale:
+		m := &Request{}
+		m.Multi = []*redis.Resp{
+			redis.NewBulkBytes([]byte("INFO")),
+		}
+		m.Batch = &sync.WaitGroup{}
+		bc.PushBack(m)
+
+		keepAliveCallback <- func() {
+			m.Batch.Wait()
+			var err = func() error {
+				if err := m.Err; err != nil {
+					return err
+				}
+				switch resp := m.Resp; {
+				case resp == nil:
+					return ErrRespIsRequired
+				case resp.IsError():
+					return fmt.Errorf("bad info resp: %s", resp.Value)
+				case resp.IsBulkBytes():
+					var info = make(map[string]string)
+					for _, line := range strings.Split(string(resp.Value), "\n") {
+						kv := strings.SplitN(line, ":", 2)
+						if len(kv) != 2 {
+							continue
+						}
+						if key := strings.TrimSpace(kv[0]); key != "" {
+							info[key] = strings.TrimSpace(kv[1])
+						}
+					}
+					if info["master_link_status"] == "down" {
+						return nil
+					}
+					if bc.state.CompareAndSwap(stateDataStale, stateConnected) {
+						log.Warnf("backend conn [%p] to %s, state = Connected (keepalive)", bc, bc.addr)
+					}
+					return nil
+				default:
+					return fmt.Errorf("bad info resp: should be string, but got %s", resp.Type)
+				}
+			}()
+			if err != nil && bc.closed.IsFalse() {
+				log.WarnErrorf(err, "backend conn [%p] to %s, recover from DataStale failed", bc, bc.addr)
+			}
+		}
 	}
-	bc.PushBack(m)
 	return true
+}
+
+var keepAliveCallback = make(chan func(), 128)
+
+func init() {
+	go func() {
+		for fn := range keepAliveCallback {
+			fn()
+		}
+	}()
 }
 
 func (bc *BackendConn) newBackendReader(round int, config *Config) (*redis.Conn, chan<- *Request, error) {
 	c, err := redis.DialTimeout(bc.addr, time.Second*5,
-		config.BackendRecvBufsize.Int(),
-		config.BackendSendBufsize.Int())
+		config.BackendRecvBufsize.AsInt(),
+		config.BackendSendBufsize.AsInt())
 	if err != nil {
 		return nil, nil, err
 	}
-	c.ReaderTimeout = config.BackendRecvTimeout.Get()
-	c.WriterTimeout = config.BackendSendTimeout.Get()
-	c.SetKeepAlivePeriod(config.BackendKeepAlivePeriod.Get())
+	c.ReaderTimeout = config.BackendRecvTimeout.Duration()
+	c.WriterTimeout = config.BackendSendTimeout.Duration()
+	c.SetKeepAlivePeriod(config.BackendKeepAlivePeriod.Duration())
 
 	if err := bc.verifyAuth(c, config.ProductAuth); err != nil {
 		c.Close()
@@ -142,14 +215,16 @@ var (
 
 func (bc *BackendConn) run() {
 	log.Warnf("backend conn [%p] to %s, start service", bc, bc.addr)
-	for k := 0; !bc.closed.Get(); k++ {
+	for k := 0; bc.closed.IsFalse(); k++ {
 		log.Warnf("backend conn [%p] to %s, rounds-[%d]", bc, bc.addr, k)
 		if err := bc.loopWriter(k); err != nil {
-			bc.failWriter()
+			bc.delayBeforeRetry()
 		}
 	}
 	log.Warnf("backend conn [%p] to %s, stop and exit", bc, bc.addr)
 }
+
+var errMasterDown = []byte("MASTERDOWN")
 
 func (bc *BackendConn) loopReader(tasks <-chan *Request, c *redis.Conn, round int) (err error) {
 	defer func() {
@@ -164,16 +239,26 @@ func (bc *BackendConn) loopReader(tasks <-chan *Request, c *redis.Conn, round in
 		if err != nil {
 			return bc.setResponse(r, nil, fmt.Errorf("backend conn failure, %s", err))
 		}
+		if resp != nil && resp.IsError() {
+			switch {
+			case bytes.HasPrefix(resp.Value, errMasterDown):
+				if bc.state.CompareAndSwap(stateConnected, stateDataStale) {
+					log.Warnf("backend conn [%p] to %s, state = DataStale, caused by 'MASTERDOWN'", bc, bc.addr)
+				}
+			}
+		}
 		bc.setResponse(r, resp, nil)
 	}
 	return nil
 }
 
-func (bc *BackendConn) failWriter() {
-	bc.ready.Set(false)
-	bc.delay = math2.MinMaxDuration(bc.delay*2, time.Millisecond*50, time.Second*5)
-	timeout := time.After(bc.delay)
-	for {
+func (bc *BackendConn) delayBeforeRetry() {
+	bc.retry.fails += 1
+	if bc.retry.fails <= 10 {
+		return
+	}
+	timeout := bc.retry.delay.After()
+	for bc.closed.IsFalse() {
 		select {
 		case <-timeout:
 			return
@@ -200,8 +285,11 @@ func (bc *BackendConn) loopWriter(round int) (err error) {
 	}
 	defer close(tasks)
 
-	bc.ready.Set(true)
-	bc.delay = 0
+	defer bc.state.Set(0)
+
+	bc.state.Set(stateConnected)
+	bc.retry.fails = 0
+	bc.retry.delay.Reset()
 
 	p := c.FlushEncoder()
 	p.MaxInterval = time.Millisecond

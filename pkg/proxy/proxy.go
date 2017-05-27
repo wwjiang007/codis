@@ -45,13 +45,13 @@ type Proxy struct {
 
 	lproxy net.Listener
 	ladmin net.Listener
-	xjodis *Jodis
 
 	ha struct {
 		monitor *redis.Sentinel
 		masters map[int]string
 		servers []string
 	}
+	jodis *Jodis
 }
 
 var ErrClosedProxy = errors.New("use of closed proxy")
@@ -68,7 +68,7 @@ func New(config *Config) (*Proxy, error) {
 	s.config = config
 	s.exit.C = make(chan struct{})
 	s.router = NewRouter(config)
-	s.ignore = make([]byte, config.ProxyHeapPlaceholder.Int())
+	s.ignore = make([]byte, config.ProxyHeapPlaceholder.Int64())
 
 	s.model = &models.Proxy{
 		StartTime: time.Now().String(),
@@ -82,7 +82,7 @@ func New(config *Config) (*Proxy, error) {
 	} else {
 		s.model.Sys = strings.TrimSpace(string(b))
 	}
-	s.model.Hostname, _ = os.Hostname()
+	s.model.Hostname = utils.Hostname
 
 	if err := s.setup(config); err != nil {
 		s.Close()
@@ -91,7 +91,7 @@ func New(config *Config) (*Proxy, error) {
 
 	log.Warnf("[%p] create new proxy:\n%s", s, s.model.Encode())
 
-	unsafe2.SetMaxOffheapBytes(config.ProxyMaxOffheapBytes.Int())
+	unsafe2.SetMaxOffheapBytes(config.ProxyMaxOffheapBytes.Int64())
 
 	go s.serveAdmin()
 	go s.serveProxy()
@@ -109,7 +109,7 @@ func (s *Proxy) setup(config *Config) error {
 	} else {
 		s.lproxy = l
 
-		x, err := utils.ResolveAddr(proto, l.Addr().String(), config.HostProxy)
+		x, err := utils.ReplaceUnspecifiedIP(proto, l.Addr().String(), config.HostProxy)
 		if err != nil {
 			return err
 		}
@@ -123,7 +123,7 @@ func (s *Proxy) setup(config *Config) error {
 	} else {
 		s.ladmin = l
 
-		x, err := utils.ResolveAddr(proto, l.Addr().String(), config.HostAdmin)
+		x, err := utils.ReplaceUnspecifiedIP(proto, l.Addr().String(), config.HostAdmin)
 		if err != nil {
 			return err
 		}
@@ -142,7 +142,7 @@ func (s *Proxy) setup(config *Config) error {
 	)
 
 	if config.JodisAddr != "" {
-		c, err := models.NewClient(config.JodisName, config.JodisAddr, config.JodisTimeout.Get())
+		c, err := models.NewClient(config.JodisName, config.JodisAddr, config.JodisTimeout.Duration())
 		if err != nil {
 			return err
 		}
@@ -151,7 +151,7 @@ func (s *Proxy) setup(config *Config) error {
 		} else {
 			s.model.JodisPath = models.JodisPath(config.ProductName, s.model.Token)
 		}
-		s.xjodis = NewJodis(c, s.model)
+		s.jodis = NewJodis(c, s.model)
 	}
 
 	return nil
@@ -168,6 +168,9 @@ func (s *Proxy) Start() error {
 	}
 	s.online = true
 	s.router.Start()
+	if s.jodis != nil {
+		s.jodis.Start()
+	}
 	return nil
 }
 
@@ -180,8 +183,8 @@ func (s *Proxy) Close() error {
 	s.closed = true
 	close(s.exit.C)
 
-	if s.xjodis != nil {
-		s.xjodis.Close()
+	if s.jodis != nil {
+		s.jodis.Close()
 	}
 	if s.ladmin != nil {
 		s.ladmin.Close()
@@ -313,39 +316,53 @@ func (s *Proxy) rewatchSentinels(servers []string) {
 	}
 	if len(servers) != 0 {
 		s.ha.monitor = redis.NewSentinel(s.config.ProductName, s.config.ProductAuth)
+		s.ha.monitor.LogFunc = log.Warnf
+		s.ha.monitor.ErrFunc = log.WarnErrorf
 		go func(p *redis.Sentinel) {
-			refetch := make(chan time.Duration)
+			var trigger = make(chan struct{}, 1)
+			delayUntil := func(deadline time.Time) {
+				for !p.IsCanceled() {
+					var d = deadline.Sub(time.Now())
+					if d <= 0 {
+						return
+					}
+					time.Sleep(math2.MinDuration(d, time.Second))
+				}
+			}
 			go func() {
-				defer func() {
-					close(refetch)
-				}()
-				for !p.IsCancelled() {
-					refetch <- 0
-					refetch <- time.Second * 10
-					timeout := time.Minute * 5
-					retryAt := time.Now().Add(time.Second * 30)
-					if !p.Subscribe(timeout, servers...) {
-						for time.Now().Before(retryAt) && !p.IsCancelled() {
-							time.Sleep(time.Second)
-						}
+				defer close(trigger)
+				callback := func() {
+					select {
+					case trigger <- struct{}{}:
+					default:
+					}
+				}
+				for !p.IsCanceled() {
+					timeout := time.Minute * 15
+					retryAt := time.Now().Add(time.Second * 10)
+					if !p.Subscribe(servers, timeout, callback) {
+						delayUntil(retryAt)
+					} else {
+						callback()
 					}
 				}
 			}()
 			go func() {
-				defer func() {
-					for _ = range refetch {
+				for _ = range trigger {
+					var success int
+					for i := 0; i != 10 && !p.IsCanceled() && success != 2; i++ {
+						timeout := time.Second * 5
+						masters, err := p.Masters(servers, timeout)
+						if err != nil {
+							log.WarnErrorf(err, "[%p] fetch group masters failed", s)
+						} else {
+							if !p.IsCanceled() {
+								s.SwitchMasters(masters)
+							}
+							success += 1
+						}
+						delayUntil(time.Now().Add(time.Second * 5))
 					}
-				}()
-				for d := range refetch {
-					if d != 0 {
-						time.Sleep(d)
-					}
-					timeout := time.Second * 10
-					masters := p.Masters(s.router.GetGroupIds(), timeout, servers...)
-					if p.IsCancelled() {
-						return
-					}
-					s.SwitchMasters(masters)
 				}
 			}()
 		}(s.ha.monitor)
@@ -398,11 +415,8 @@ func (s *Proxy) serveProxy() {
 		}
 	}(s.lproxy)
 
-	if d := s.config.BackendPingPeriod; d != 0 {
-		go s.keepAlive(d.Get())
-	}
-	if s.xjodis != nil {
-		s.xjodis.Start()
+	if d := s.config.BackendPingPeriod.Duration(); d != 0 {
+		go s.keepAlive(d)
 	}
 
 	select {
@@ -427,14 +441,16 @@ func (s *Proxy) keepAlive(d time.Duration) {
 }
 
 func (s *Proxy) acceptConn(l net.Listener) (net.Conn, error) {
-	var delay int
+	var delay = &DelayExp2{
+		Min: 10, Max: 500,
+		Unit: time.Millisecond,
+	}
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			if e, ok := err.(net.Error); ok && e.Temporary() {
 				log.WarnErrorf(err, "[%p] proxy accept new connection failed", s)
-				delay = math2.MinMaxInt(delay*2, 10, 500)
-				time.Sleep(time.Duration(delay) * time.Millisecond)
+				delay.Sleep()
 				continue
 			}
 		}
@@ -516,7 +532,7 @@ type RuntimeStats struct {
 	NumProcs      int   `json:"num_procs"`
 	NumGoroutines int   `json:"num_goroutines"`
 	NumCgoCall    int64 `json:"num_cgo_call"`
-	MemOffheap    int   `json:"mem_offheap"`
+	MemOffheap    int64 `json:"mem_offheap"`
 }
 
 type StatsFlags uint32

@@ -15,6 +15,7 @@ import (
 	"github.com/CodisLabs/codis/pkg/proxy/redis"
 	"github.com/CodisLabs/codis/pkg/utils/errors"
 	"github.com/CodisLabs/codis/pkg/utils/log"
+	"github.com/CodisLabs/codis/pkg/utils/math2"
 	"github.com/CodisLabs/codis/pkg/utils/sync2/atomic2"
 )
 
@@ -61,12 +62,12 @@ func (s *Session) String() string {
 
 func NewSession(sock net.Conn, config *Config) *Session {
 	c := redis.NewConn(sock,
-		config.SessionRecvBufsize.Int(),
-		config.SessionSendBufsize.Int(),
+		config.SessionRecvBufsize.AsInt(),
+		config.SessionSendBufsize.AsInt(),
 	)
-	c.ReaderTimeout = config.SessionRecvTimeout.Get()
-	c.WriterTimeout = config.SessionSendTimeout.Get()
-	c.SetKeepAlivePeriod(config.SessionKeepAlivePeriod.Get())
+	c.ReaderTimeout = config.SessionRecvTimeout.Duration()
+	c.WriterTimeout = config.SessionSendTimeout.Duration()
+	c.SetKeepAlivePeriod(config.SessionKeepAlivePeriod.Duration())
 
 	s := &Session{
 		Conn: c, config: config,
@@ -103,6 +104,8 @@ func (s *Session) CloseWithError(err error) error {
 var (
 	ErrTooManySessions = errors.New("too many sessions")
 	ErrRouterNotOnline = errors.New("router is not online")
+
+	ErrTooManyPipelinedRequests = errors.New("too many pipelined requests")
 )
 
 var RespOK = redis.NewString([]byte("OK"))
@@ -127,7 +130,7 @@ func (s *Session) Start(d *Router) {
 			return
 		}
 
-		tasks := make(chan *Request, s.config.SessionMaxPipeline)
+		tasks := make(chan *Request, math2.MaxInt(1, s.config.SessionMaxPipeline))
 
 		go func() {
 			s.loopWriter(tasks)
@@ -161,8 +164,12 @@ func (s *Session) loopReader(tasks chan<- *Request, d *Router) (err error) {
 
 		r := &Request{}
 		r.Multi = multi
-		r.Start = start.UnixNano()
 		r.Batch = &sync.WaitGroup{}
+		r.UnixNano = start.UnixNano()
+
+		if len(tasks) == cap(tasks) {
+			return ErrTooManyPipelinedRequests
+		}
 		if err := s.handleRequest(r, d); err != nil {
 			r.Resp = redis.NewErrorf("ERR handle request, %s", err)
 			tasks <- r
@@ -270,7 +277,9 @@ func (s *Session) handleRequest(r *Request, d *Router) error {
 	case "MSET":
 		return s.handleRequestMSet(r, d)
 	case "DEL":
-		return s.handleRequestMDel(r, d)
+		return s.handleRequestDel(r, d)
+	case "EXISTS":
+		return s.handleRequestExists(r, d)
 	case "SLOTSINFO":
 		return s.handleRequestSlotsInfo(r, d)
 	case "SLOTSSCAN":
@@ -439,7 +448,7 @@ func (s *Session) handleRequestMSet(r *Request, d *Router) error {
 	return nil
 }
 
-func (s *Session) handleRequestMDel(r *Request, d *Router) error {
+func (s *Session) handleRequestDel(r *Request, d *Router) error {
 	var nkeys = len(r.Multi) - 1
 	switch {
 	case nkeys == 0:
@@ -472,7 +481,49 @@ func (s *Session) handleRequestMDel(r *Request, d *Router) error {
 					n++
 				}
 			default:
-				return fmt.Errorf("bad mdel resp: %s value.len = %d", resp.Type, len(resp.Value))
+				return fmt.Errorf("bad del resp: %s value.len = %d", resp.Type, len(resp.Value))
+			}
+		}
+		r.Resp = redis.NewInt(strconv.AppendInt(nil, int64(n), 10))
+		return nil
+	}
+	return nil
+}
+
+func (s *Session) handleRequestExists(r *Request, d *Router) error {
+	var nkeys = len(r.Multi) - 1
+	switch {
+	case nkeys == 0:
+		r.Resp = redis.NewErrorf("ERR wrong number of arguments for 'EXISTS' command")
+		return nil
+	case nkeys == 1:
+		return d.dispatch(r)
+	}
+	var sub = r.MakeSubRequest(nkeys)
+	for i := range sub {
+		sub[i].Multi = []*redis.Resp{
+			r.Multi[0],
+			r.Multi[i+1],
+		}
+		if err := d.dispatch(&sub[i]); err != nil {
+			return err
+		}
+	}
+	r.Coalesce = func() error {
+		var n int
+		for i := range sub {
+			if err := sub[i].Err; err != nil {
+				return err
+			}
+			switch resp := sub[i].Resp; {
+			case resp == nil:
+				return ErrRespIsRequired
+			case resp.IsInt() && len(resp.Value) == 1:
+				if resp.Value[0] != '0' {
+					n++
+				}
+			default:
+				return fmt.Errorf("bad exists resp: %s value.len = %d", resp.Type, len(resp.Value))
 			}
 		}
 		r.Resp = redis.NewInt(strconv.AppendInt(nil, int64(n), 10))
@@ -582,7 +633,7 @@ func (s *Session) getOpStats(opstr string) *opStats {
 func (s *Session) incrOpStats(r *Request, t redis.RespType) {
 	e := s.getOpStats(r.OpStr)
 	e.calls.Incr()
-	e.nsecs.Add(time.Now().UnixNano() - r.Start)
+	e.nsecs.Add(time.Now().UnixNano() - r.UnixNano)
 	switch t {
 	case redis.TypeError:
 		e.redis.errors.Incr()
@@ -607,7 +658,7 @@ func (s *Session) flushOpStats(force bool) {
 
 	incrOpTotal(s.stats.total.Swap(0))
 	for _, e := range s.stats.opmap {
-		if e.calls.Get() != 0 || e.fails.Get() != 0 {
+		if e.calls.Int64() != 0 || e.fails.Int64() != 0 {
 			incrOpStats(e)
 		}
 	}

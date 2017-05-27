@@ -5,10 +5,12 @@ package proxy
 
 import (
 	"sync"
+	"time"
 
 	"github.com/CodisLabs/codis/pkg/models"
 	"github.com/CodisLabs/codis/pkg/utils/errors"
 	"github.com/CodisLabs/codis/pkg/utils/log"
+	"github.com/CodisLabs/codis/pkg/utils/redis"
 )
 
 const MaxSlotNum = models.MaxSlotNum
@@ -59,27 +61,12 @@ func (s *Router) Close() {
 	}
 }
 
-func (s *Router) GetGroupIds() map[int]bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var groups = make(map[int]bool)
-	for i := range s.slots {
-		if gid := s.slots[i].backend.id; gid != 0 {
-			groups[gid] = true
-		}
-		if gid := s.slots[i].migrate.id; gid != 0 {
-			groups[gid] = true
-		}
-	}
-	return groups
-}
-
 func (s *Router) GetSlots() []*models.Slot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	slots := make([]*models.Slot, MaxSlotNum)
 	for i := range s.slots {
-		slots[i] = s.slots[i].snapshot(true)
+		slots[i] = s.slots[i].snapshot()
 	}
 	return slots
 }
@@ -91,7 +78,7 @@ func (s *Router) GetSlot(id int) *models.Slot {
 		return nil
 	}
 	slot := &s.slots[id]
-	return slot.snapshot(true)
+	return slot.snapshot()
 }
 
 func (s *Router) HasSwitched() bool {
@@ -213,11 +200,21 @@ func (s *Router) fillSlot(m *models.Slot, switched bool) {
 	}
 	if !s.closed {
 		if slot.migrate.bc != nil {
-			log.Warnf("fill   slot %04d, backend.addr = %s, migrate.from = %s, locked = %t",
-				slot.id, slot.backend.bc.Addr(), slot.migrate.bc.Addr(), slot.lock.hold)
+			if switched {
+				log.Warnf("fill slot %04d, backend.addr = %s, migrate.from = %s, locked = %t, +switched",
+					slot.id, slot.backend.bc.Addr(), slot.migrate.bc.Addr(), slot.lock.hold)
+			} else {
+				log.Warnf("fill slot %04d, backend.addr = %s, migrate.from = %s, locked = %t",
+					slot.id, slot.backend.bc.Addr(), slot.migrate.bc.Addr(), slot.lock.hold)
+			}
 		} else {
-			log.Warnf("fill   slot %04d, backend.addr = %s, locked = %t",
-				slot.id, slot.backend.bc.Addr(), slot.lock.hold)
+			if switched {
+				log.Warnf("fill slot %04d, backend.addr = %s, locked = %t, +switched",
+					slot.id, slot.backend.bc.Addr(), slot.lock.hold)
+			} else {
+				log.Warnf("fill slot %04d, backend.addr = %s, locked = %t",
+					slot.id, slot.backend.bc.Addr(), slot.lock.hold)
+			}
 		}
 	}
 }
@@ -228,32 +225,39 @@ func (s *Router) SwitchMasters(masters map[int]string) error {
 	if s.closed {
 		return ErrClosedRouter
 	}
+	cache := &redis.InfoCache{
+		Auth: s.config.ProductAuth, Timeout: time.Millisecond * 100,
+	}
 	for i := range s.slots {
-		s.trySwitchMaster(i, masters)
+		s.trySwitchMaster(i, masters, cache)
 	}
 	return nil
 }
 
-func (s *Router) trySwitchMaster(id int, masters map[int]string) {
-	var update bool
-	var m = s.slots[id].snapshot(false)
+func (s *Router) trySwitchMaster(id int, masters map[int]string, cache *redis.InfoCache) {
+	var switched bool
+	var m = s.slots[id].snapshot()
+
+	hasSameRunId := func(addr1, addr2 string) bool {
+		if addr1 != addr2 {
+			rid1 := cache.GetRunId(addr1)
+			rid2 := cache.GetRunId(addr2)
+			return rid1 != "" && rid1 == rid2
+		}
+		return true
+	}
 
 	if addr := masters[m.BackendAddrGroupId]; addr != "" {
-		if addr != m.BackendAddr {
-			m.BackendAddr = addr
-			update = true
+		if !hasSameRunId(addr, m.BackendAddr) {
+			m.BackendAddr, switched = addr, true
 		}
 	}
-	if from := masters[m.MigrateFromGroupId]; from != "" {
-		if from != m.MigrateFrom {
-			m.MigrateFrom = from
-			update = true
+	if addr := masters[m.MigrateFromGroupId]; addr != "" {
+		if !hasSameRunId(addr, m.MigrateFrom) {
+			m.MigrateFrom, switched = addr, true
 		}
 	}
-	if !update {
-		return
+	if switched {
+		s.fillSlot(m, true)
 	}
-	log.Warnf("slot %04d +switch-master", id)
-
-	s.fillSlot(m, true)
 }

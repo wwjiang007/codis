@@ -21,16 +21,17 @@ func (p *Proxy) startMetricsReporter(d time.Duration, do, cleanup func() error) 
 		}
 		var ticker = time.NewTicker(d)
 		defer ticker.Stop()
-		var delay int
+		var delay = &DelayExp2{
+			Min: 1, Max: 15,
+			Unit: time.Second,
+		}
 		for !p.IsClosed() {
-			for i := 0; i < delay; i++ {
-				<-ticker.C
-			}
+			<-ticker.C
 			if err := do(); err != nil {
 				log.WarnErrorf(err, "report metrics failed")
-				delay = math2.MinMaxInt(delay*2, 1, 30)
+				delay.SleepWithCancel(p.IsClosed)
 			} else {
-				delay = 1
+				delay.Reset()
 			}
 		}
 	}()
@@ -38,7 +39,7 @@ func (p *Proxy) startMetricsReporter(d time.Duration, do, cleanup func() error) 
 
 func (p *Proxy) startMetricsJson() {
 	server := p.config.MetricsReportServer
-	period := p.config.MetricsReportPeriod.Get()
+	period := p.config.MetricsReportPeriod.Duration()
 	if server == "" {
 		return
 	}
@@ -51,7 +52,7 @@ func (p *Proxy) startMetricsJson() {
 
 func (p *Proxy) startMetricsInfluxdb() {
 	server := p.config.MetricsReportInfluxdbServer
-	period := p.config.MetricsReportInfluxdbPeriod.Get()
+	period := p.config.MetricsReportInfluxdbPeriod.Duration()
 	if server == "" {
 		return
 	}
